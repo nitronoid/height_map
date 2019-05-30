@@ -1,0 +1,6 @@
+obj
+cudaobj
+project
+*.qmake*
+Makefile
+makefile

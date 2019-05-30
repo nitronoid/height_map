@@ -1,0 +1,12 @@
+[submodule "thirdparty/value-ptr-lite"]
+	path = thirdparty/value-ptr-lite
+	url = git@github.com:nitronoid/value-ptr-lite.git
+[submodule "thirdparty/stb"]
+	path = thirdparty/stb
+	url = git@github.com:nothings/stb.git
+[submodule "thirdparty/gsl-lite"]
+	path = thirdparty/gsl-lite
+	url = git@github.com:nitronoid/gsl-lite.git
+[submodule "thirdparty/cub"]
+	path = thirdparty/cub
+	url = git@github.com:NVlabs/cub.git
