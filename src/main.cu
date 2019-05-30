@@ -120,51 +120,25 @@ cusparse_add(cusp::coo_matrix<int, real, cusp::device_memory>::const_view di_A,
   // Not sure if this is needed
   cusparseSetPointerMode(handle, CUSPARSE_POINTER_MODE_HOST);
   // Compute the workspace size for the sparse matrix add
-  cusparseScsrgeam2_bufferSizeExt(handle,
-                                  di_A.num_rows,
-                                  di_A.num_cols,
-                                  &alpha,
-                                  A_description,
-                                  di_A.num_entries,
-                                  di_A.values.begin().base().get(),
-                                  A_row_offsets.begin().base().get(),
-                                  di_A.column_indices.begin().base().get(),
-                                  &beta,
-                                  B_description,
-                                  di_B.num_entries,
-                                  di_B.values.begin().base().get(),
-                                  B_row_offsets.begin().base().get(),
-                                  di_B.column_indices.begin().base().get(),
-                                  C_description,
-                                  // Not sure why the API forces these
-                                  nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  &buffer_size);
-
-  using device_temp_t = std::unique_ptr<void, cudaError_t (*)(void* const)>;
-  device_temp_t workspace(thrust::device_malloc(buffer_size).get(), cudaFree);
-
   int C_nnz = 0;
   // &C_nnz points to a host variable
 
   cusp::array1d<int, cusp::device_memory> C_row_offsets(di_A.num_rows + 1);
 
-  cusparseXcsrgeam2Nnz(handle,
-                       di_A.num_rows,
-                       di_A.num_cols,
-                       A_description,
-                       di_A.num_entries,
-                       A_row_offsets.begin().base().get(),
-                       di_A.column_indices.begin().base().get(),
-                       B_description,
-                       di_B.num_entries,
-                       B_row_offsets.begin().base().get(),
-                       di_B.column_indices.begin().base().get(),
-                       C_description,
-                       C_row_offsets.begin().base().get(),
-                       &C_nnz,
-                       workspace.get());
+  cusparseXcsrgeamNnz(handle,
+                      di_A.num_rows,
+                      di_A.num_cols,
+                      A_description,
+                      di_A.num_entries,
+                      A_row_offsets.begin().base().get(),
+                      di_A.column_indices.begin().base().get(),
+                      B_description,
+                      di_B.num_entries,
+                      B_row_offsets.begin().base().get(),
+                      di_B.column_indices.begin().base().get(),
+                      C_description,
+                      C_row_offsets.begin().base().get(),
+                      &C_nnz);
   C_nnz = C_row_offsets[di_A.num_rows] - C_row_offsets[0];
 
   cusp::csr_matrix<int, real, cusp::device_memory> do_C(
@@ -172,27 +146,124 @@ cusparse_add(cusp::coo_matrix<int, real, cusp::device_memory>::const_view di_A,
   do_C.row_offsets = std::move(C_row_offsets);
 
   // Now actually do the add
-  cusparseScsrgeam2(handle,
-                    di_A.num_rows,
-                    di_A.num_cols,
-                    &alpha,
-                    A_description,
-                    di_A.num_entries,
-                    di_A.values.begin().base().get(),
-                    A_row_offsets.begin().base().get(),
-                    di_A.column_indices.begin().base().get(),
-                    &beta,
-                    B_description,
-                    di_B.num_entries,
-                    di_B.values.begin().base().get(),
-                    B_row_offsets.begin().base().get(),
-                    di_B.column_indices.begin().base().get(),
-                    C_description,
-                    do_C.values.begin().base().get(),
-                    do_C.row_offsets.begin().base().get(),
-                    do_C.column_indices.begin().base().get(),
-                    workspace.get());
+  cusparseScsrgeam(handle,
+                   di_A.num_rows,
+                   di_A.num_cols,
+                   &alpha,
+                   A_description,
+                   di_A.num_entries,
+                   di_A.values.begin().base().get(),
+                   A_row_offsets.begin().base().get(),
+                   di_A.column_indices.begin().base().get(),
+                   &beta,
+                   B_description,
+                   di_B.num_entries,
+                   di_B.values.begin().base().get(),
+                   B_row_offsets.begin().base().get(),
+                   di_B.column_indices.begin().base().get(),
+                   C_description,
+                   do_C.values.begin().base().get(),
+                   do_C.row_offsets.begin().base().get(),
+                   do_C.column_indices.begin().base().get());
   return do_C;
+}
+
+void build_M(
+    float3 L,
+    cusp::coo_matrix<int, real, cusp::device_memory>::view do_M)
+{
+  const int nnormals = do_M.num_rows / 3;
+  // Outer product of the lighting direction
+  // clang-format off
+  real LLT[9] = {L.x * L.x, L.x * L.y, L.x * L.z,
+                 L.x * L.y, L.y * L.y, L.y * L.z,
+                 L.x * L.z, L.y * L.z, L.z * L.z};
+  // clang-format on
+  // Copy to the device
+  thrust::device_vector<real> d_LLT(LLT, LLT + 9);
+  // Perform a kronecker product of LLT with the Identity matrix
+  // We want to iterate over each row of LLT, n times where n is the number of
+  // normals
+  const auto LLT_row = detail::make_row_iterator(nnormals * 3);
+  // We want to iterate over each column of LLT, in a repeating cycle for each n
+  const auto LLT_col = detail::make_column_iterator(3);
+  // Now we can combine the two
+  const auto LLT_i = thrust::make_transform_iterator(
+    detail::zip_it(LLT_row, LLT_col),
+    [=] __host__ __device__(const thrust::tuple<int, int>& coord) {
+      return coord.get<0>() * 3 + coord.get<1>();
+    });
+  // Use the look up index to get the real value from LLT
+  const auto LLT_v = thrust::make_permutation_iterator(d_LLT.begin(), LLT_i);
+  // Copy the values across to M
+  thrust::copy_n(LLT_v, nnormals * 9, do_M.values.begin());
+  // The row keys will be i / 3, as we only have 3 values per row and column
+  const auto count = thrust::make_counting_iterator(0);
+  thrust::transform(count,
+                    count + nnormals * 9,
+                    do_M.row_indices.begin(),
+                    detail::unary_divides<int>(3));
+  // To write the column keys we need a repeating sequence of 0, 1, 2 * n to
+  // give 0, n, 2n, and then we offset by the row % n
+  thrust::transform(LLT_col,
+                    LLT_col + nnormals * 9,
+                    do_M.row_indices.begin(),
+                    do_M.column_indices.begin(),
+                    [=] __host__ __device__(int s, int r) {
+                      return (r % nnormals) + s * nnormals;
+                    });
+}
+
+void build_B(
+    const int m,
+    const int n,
+    cusp::coo_matrix<int, real, cusp::device_memory>::view do_B)
+{
+  const int nsb = do_B.num_entries / 3;
+  const int nnormals = m*n;
+  auto entry_it = detail::zip_it(do_B.row_indices.begin(),
+                                 do_B.column_indices.begin(),
+                                 do_B.values.begin());
+  // Build the discrete Poisson problem matrix
+  cusp::coo_matrix<int, real, cusp::device_memory> d_temp;
+  cusp::gallery::poisson5pt(d_temp, m, n);
+  const auto temp_begin = detail::zip_it(d_temp.row_indices.begin(),
+                                         d_temp.column_indices.begin(),
+                                         d_temp.values.begin());
+  thrust::copy_n(temp_begin, nsb, entry_it);
+
+  using tup3 = thrust::tuple<int, int, real>;
+  const auto fix_bnds = [=] __host__ __device__(tup3 entry) {
+    // Fix boundary cell diagonals
+    if (entry.get<0>() == entry.get<1>())
+    {
+      const int r = entry.get<0>() / n;
+      const int c = entry.get<0>() % n;
+      // If we're in a boundary cell we subtract one from the valence
+      entry.get<2>() -= (r == 0 || r == (m - 1));
+      entry.get<2>() -= (c == 0 || c == (n - 1));
+    }
+    return entry;
+  };
+  // Fix the boundary cell diagonals
+  thrust::transform(entry_it, entry_it + nsb, entry_it, fix_bnds);
+
+  // Correct the boundaries which don't have valence of 4 and copy the
+  // corrected B for each channel of the normal vectors (3 times).
+  // Tuple of [Row, Column, Value]
+  auto entry_s = detail::make_cycle_iterator(entry_it, nsb);
+
+  // Copy sB 3 times, offsetting by it's width and height for each new copy
+  const auto op = [=] __host__ __device__(tup3 entry, int count) {
+    // Work out what channel we're in
+    const int channel = count / nsb;
+    // Offset for the channel
+    entry.get<0>() += channel * nnormals;
+    entry.get<1>() += channel * nnormals;
+    return entry;
+  };
+  const auto count = thrust::make_counting_iterator(nsb);
+  thrust::transform(entry_s, entry_s + nsb * 2, count, entry_it + nsb, op);
 }
 
 int main(int argc, char* argv[])
@@ -216,102 +287,24 @@ int main(int argc, char* argv[])
 
   // Lighting direction
   float3 L{1.f, 2.f, 3.f};
-  // Outer product of the lighting direction
-  // clang-format off
-  real LLT[9] = {L.x * L.x, L.x * L.y, L.x * L.z,
-                 L.x * L.y, L.y * L.y, L.y * L.z,
-                 L.x * L.z, L.y * L.z, L.z * L.z};
-  // clang-format on
-  // Copy to the device
-  thrust::device_vector<real> d_LLT(LLT, LLT + 9);
   cusp::coo_matrix<int, real, cusp::device_memory> d_M(
     nnormals * 3, nnormals * 3, nnormals * 9);
-  // Perform a kronecker product of LLT with the Identity matrix
-  // We want to iterate over each row of LLT, n times where n is the number of
-  // normals
-  const auto LLT_row = detail::make_row_iterator(nnormals * 3);
-  // We want to iterate over each column of LLT, in a repeating cycle for each n
-  const auto LLT_col = detail::make_column_iterator(3);
-  // Now we can combine the two
-  const auto LLT_i = thrust::make_transform_iterator(
-    detail::zip_it(LLT_row, LLT_col),
-    [=] __host__ __device__(const thrust::tuple<int, int>& coord) {
-      return coord.get<0>() * 3 + coord.get<1>();
-    });
-  // Use the look up index to get the real value from LLT
-  const auto LLT_v = thrust::make_permutation_iterator(d_LLT.begin(), LLT_i);
-  // Copy the values across to M
-  thrust::copy_n(LLT_v, nnormals * 9, d_M.values.begin());
-
-  // The row keys will be i / 3, as we only have 3 values per row and column
-  const auto count = thrust::make_counting_iterator(0);
-  thrust::transform(count,
-                    count + nnormals * 9,
-                    d_M.row_indices.begin(),
-                    detail::unary_divides<int>(3));
-
-  // To write the column keys we need a repeating sequence of 0, 1, 2 * n to
-  // give 0, n, 2n, and then we offset by the row % n
-  thrust::transform(LLT_col,
-                    LLT_col + nnormals * 9,
-                    d_M.row_indices.begin(),
-                    d_M.column_indices.begin(),
-                    [=] __host__ __device__(int s, int r) {
-                      return (r % nnormals) + s * nnormals;
-                    });
+  build_M(L, d_M);
+  printf("M has been built\n");
 
   // B is our pixel 4-neighborhood adjacency matrix
-  cusp::coo_matrix<int, real, cusp::device_memory> d_sB;
-  // Build the discrete Poisson problem matrix
-  cusp::gallery::poisson5pt(d_sB, width, height);
-  // cusp::print(d_sB);
   cusp::coo_matrix<int, real, cusp::device_memory> d_B(
-    d_sB.num_rows * 3, d_sB.num_cols * 3, d_sB.num_entries * 3);
-
-  {
-    const int nsb = d_sB.num_entries;
-    // Correct the boundaries which don't have valence of 4 and copy the
-    // corrected B for each channel of the normal vectors (3 times).
-    // Tuple of [Row, Column, Value]
-    const auto entry_in =
-      detail::make_cycle_iterator(detail::zip_it(d_sB.row_indices.begin(),
-                                                 d_sB.column_indices.begin(),
-                                                 d_sB.values.begin()),
-                                  nsb);
-    auto entry_out = detail::zip_it(
-      d_B.row_indices.begin(), d_B.column_indices.begin(), d_B.values.begin());
-
-    using tup3 = thrust::tuple<int, int, real>;
-    // Copy sB 3 times, offsetting by it's width and height for each new copy
-    const auto op = [=] __host__ __device__(tup3 entry, int count) {
-      // Work out what channel we're in
-      const int channel = count / nsb;
-      // Fix boundary cell diagonals
-      if (entry.get<0>() == entry.get<1>())
-      {
-        const int r = entry.get<0>() / width;
-        const int c = entry.get<0>() % width;
-        // If we're in a boundary cell we subtract one from the valence
-        entry.get<2>() -= (r == 0 || r == (height - 1));
-        entry.get<2>() -= (c == 0 || c == (width - 1));
-      }
-      // Offset for the channel
-      entry.get<0>() += channel * nnormals;
-      entry.get<1>() += channel * nnormals;
-      return entry;
-    };
-    thrust::transform(entry_in, entry_in + nsb * 3, count, entry_out, op);
-  }
+    nnormals * 3, nnormals * 3, 3 * (5 * height * height - 4 * height));
+  build_B(height, width, d_B);
+  printf("B has been built\n");
   // cusp::print(d_B);
 
   // Now we build A using M and B
   // A = M + 8lmI -2lmB <=> A = M + 2lm(4I - B)
   // So we use cuSparse to compute alpha * M + beta * B, where beta is 2lm
-
-  const real lambda = 0.1f;
   // Now we can add M
   auto d_A = cusparse_add(d_M, d_B);
-  // cusp::print(d_A);
+  printf("A has been built\n");
 
   // The b vector of the system is (shading intensity * L), where L repeats
   // Copy L to the device
@@ -367,16 +360,10 @@ int main(int argc, char* argv[])
     M(d_A, d_b, d_x);
     // Normalize
     normalize_all();
-    // Ensure Z is pointing outwards
-    //thrust::transform(d_x.begin() + nnormals * 2,
-    //                  d_x.end(),
-    //                  d_x.begin() + nnormals * 2,
-    //                  detail::unary_abs<real>());
     // Compute the residual
     cusp::multiply(d_A, d_x, d_r);
     cusp::blas::axpy(d_b, d_r, -1.f);
   }
-
   printf("Done\n");
   auto d_relative_normals = cusp::make_array2d_view(
     3, nnormals, nnormals, cusp::make_array1d_view(d_x), cusp::row_major{});
@@ -385,7 +372,6 @@ int main(int argc, char* argv[])
 
   make_host_image(d_relative_normals, h_image.get());
   stbi::writef("relative_normals.png", h_image);
-
   make_host_image(d_image, h_image.get());
   stbi::writef("out.png", h_image);
 }

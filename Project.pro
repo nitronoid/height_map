@@ -19,9 +19,9 @@ INCLUDEPATH += \
 HEADERS += $$files(include/*.(h | hpp | cuh), true) 
 
 # Standard flags
-QMAKE_CXXFLAGS += -std=c++14 -g
+QMAKE_CXXFLAGS += -std=c++11 -g
 # Optimisation flags
-QMAKE_CXXFLAGS += -Ofast -march=native -frename-registers -funroll-loops -ffast-math -fassociative-math
+QMAKE_CXXFLAGS += -Ofast -march=native -frename-registers -funroll-loops -ffast-math -fassociative-math -fopenmp
 # Intrinsics flags
 QMAKE_CXXFLAGS += -mfma -mavx2 -m64 -msse -msse2 -msse3
 # Enable all warnings
@@ -38,7 +38,7 @@ LIBS += -lcudart -lcurand -licudata -lcudart_static -lcudadevrt -lcusolver -lcus
 
 CUDA_INC += $$join(INCLUDEPATH, ' -I', '-I', ' ')
 
-NVCCFLAGS += -ccbin ${HOST_COMPILER} -pg -g -lineinfo --std=c++14 -O3 --expt-extended-lambda --expt-relaxed-constexpr
+NVCCFLAGS += -ccbin ${HOST_COMPILER} -pg -g -lineinfo --std=c++11 -O3 --expt-extended-lambda --expt-relaxed-constexpr
 NVCCFLAGS += -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH}
 NVCCFLAGS += -Xcompiler -fno-strict-aliasing -Xcompiler -fPIC 
 NVCCFLAGS += -Xptxas -O3 --use_fast_math --restrict
@@ -70,3 +70,4 @@ cudalink.dependency_type = TYPE_C
 cudalink.depend_command = $${CUDA_COMPILE_BASE} -M
 QMAKE_EXTRA_COMPILERS += cudalink
 
+LIBS += -fopenmp
