@@ -116,7 +116,6 @@ cusparse_add(cusp::coo_matrix<int, real, cusp::device_memory>::const_view di_A,
   const real alpha = 1.f;
   const real beta = 0.001f;
 
-  std::size_t buffer_size = 0;
   // Not sure if this is needed
   cusparseSetPointerMode(handle, CUSPARSE_POINTER_MODE_HOST);
   // Compute the workspace size for the sparse matrix add
@@ -266,6 +265,103 @@ void build_B(
   thrust::transform(entry_s, entry_s + nsb * 2, count, entry_it + nsb, op);
 }
 
+struct relative_height_from_normals
+{
+  using vec2 = thrust::tuple<real, real>;
+
+  __host__ __device__ real dot(const vec2& n1, const vec2& n2) const noexcept
+  {
+    return n1.get<0>() * n2.get<0>() + n1.get<1>() * n2.get<1>();
+  }
+
+  __host__ __device__ real det(const vec2& n1, const vec2& n2) const noexcept
+  {
+    return n1.get<0>() * n2.get<1>() - n1.get<1>() * n2.get<0>();
+  }
+
+
+  __host__ __device__ real operator()(const vec2& n1, const vec2& n2) const noexcept
+  {
+    // Compute the gradient of each vector
+    const real gradient_n1 = n1.get<1>() / n1.get<0>();
+    const real gradient_n2 = n2.get<1>() / n2.get<0>();
+    // Get the positive internal angle between n1 and n2
+    const real theta = std::abs(std::atan2(det(n1, n2), dot(n1, n2)));
+    const real tan_gamma = std::tan(0.5f * (real(M_PI) - theta));
+    const real q = (tan_gamma - gradient_n1) / (1.f - gradient_n1 * tan_gamma);
+    return std::abs(gradient_n1) > std::abs(gradient_n2) ? -q : q;
+  }
+};
+
+void build_Q_diagonals(
+    cusp::array2d<real, cusp::device_memory>::view di_normals,
+    cusp::coo_matrix<int, real, cusp::device_memory>::view do_Q)
+{
+  // Iterate over the normals with their index
+  const auto count = thrust::make_counting_iterator(0);
+  const auto normal_begin = detail::zip_it(di_normals.row(0).begin(),
+                                           di_normals.row(1).begin(),
+                                           di_normals.row(2).begin(),
+                                           count);
+  // Iterate over pairs of normals using the matrix coordinates
+  const auto n1_begin = 
+    thrust::make_permutation_iterator(normal_begin, do_Q.row_indices.begin());
+  const auto n2_begin = 
+    thrust::make_permutation_iterator(normal_begin, do_Q.column_indices.begin());
+  const auto n1_end = n1_begin + do_Q.num_entries;
+
+  using vec = thrust::tuple<real, real, real, int>;
+  thrust::transform(n1_begin, n1_end, n2_begin, do_Q.values.begin(),
+      [] __host__ __device__ (const vec& i_n1, const vec& i_n2)
+      {
+        // Check whether these normals are vertical or horizontal neighbors
+        // and project the normals accordingly
+        auto n1 = thrust::make_tuple(0.f, i_n1.get<2>());
+        auto n2 = thrust::make_tuple(0.f, i_n2.get<2>());
+        if (std::abs(i_n1.get<3>() - i_n2.get<3>()) == 1)
+        {
+          n1.get<0>() = i_n1.get<0>();
+          n2.get<0>() = i_n2.get<0>();
+        }
+        else
+        {
+          n1.get<0>() = i_n1.get<1>();
+          n2.get<0>() = i_n2.get<1>();
+        }
+        return relative_height_from_normals{}(n1, n2);
+      });
+}
+
+void build_poisson_b(
+    const int m,
+    const int n,
+    cusp::coo_matrix<int, real, cusp::device_memory>::const_view di_Q,
+    cusp::array1d<real, cusp::device_memory>::view do_b)
+{
+  // Build I - M, essentially a Poisson, with 1 down the diagonal
+  cusp::coo_matrix<int, real, cusp::device_memory> d_temp;
+  cusp::gallery::poisson5pt(d_temp, m, n);
+  auto temp_begin = detail::zip_it(d_temp.row_indices.begin(),
+                                   d_temp.column_indices.begin(),
+                                   d_temp.values.begin());
+  using tup3 = thrust::tuple<int, int, real>;
+  thrust::transform(
+    temp_begin, 
+    temp_begin + d_temp.num_entries,
+    temp_begin,
+    [=] __host__ __device__(tup3 entry) {
+      // Fix boundary cell diagonals
+      entry.get<2>() = (entry.get<0>() == entry.get<1>()) ? 1.f : -1.f;
+      return entry;
+    });
+  // SpMv (I - M) * O, where O is the vector of 0.5's
+  cusp::array1d<real, cusp::device_memory> d_O(do_b.size(), 0.5f);
+  cusp::multiply(d_temp, d_O, do_b);
+  // SpMv Q * ((I - M) * O)
+  thrust::copy(do_b.begin(), do_b.begin(), d_O.begin());
+  cusp::multiply(di_Q, d_O, do_b);
+}
+
 int main(int argc, char* argv[])
 {
   assert(argc >= 2);
@@ -369,6 +465,28 @@ int main(int argc, char* argv[])
     3, nnormals, nnormals, cusp::make_array1d_view(d_x), cusp::row_major{});
 
   // Now that we have relative normals, we calculate the relative heights
+  cusp::coo_matrix<int, real, cusp::device_memory> d_Q(
+    nnormals, nnormals, 4 * height * (height - 1));
+  // Initialize a grid matrix using CUSP
+  cusp::gallery::grid2d(d_Q, height, width);
+  build_Q_diagonals(d_relative_normals, d_Q);
+  cusp::print(d_Q.values.subarray(0, 20));
+
+  // Now we can assemble a poisson problem to solve the absolute heights
+  cusp::array1d<real, cusp::device_memory> d_pb(nnormals);
+  build_poisson_b(height, width, d_Q, d_pb);
+  cusp::print(d_pb.subarray(0, 20));
+
+
+  // The A matrix
+  cusp::coo_matrix<int, real, cusp::device_memory> d_pA(
+    nnormals, nnormals, 5 * height * height - 4 * height);
+  cusp::gallery::poisson5pt(d_pA, height, width);
+  // To get a result we need to "pin" the solution by setting an arbitrary
+  // value to some constant. I use the final height.
+
+  
+
 
   make_host_image(d_relative_normals, h_image.get());
   stbi::writef("relative_normals.png", h_image);
