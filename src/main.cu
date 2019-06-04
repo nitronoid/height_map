@@ -21,6 +21,7 @@
 #include <cusp/relaxation/sor.h>
 #include <cusp/relaxation/jacobi.h>
 #include <cusp/krylov/cg.h>
+#include <cusp/krylov/bicgstab.h>
 #include <cusp/linear_operator.h>
 #include <cusp/precond/diagonal.h>
 #include <cusp/monitor.h>
@@ -275,6 +276,17 @@ constexpr __host__ __device__ real signum(T val)
   return (T(0) <= val) - (val < T(0));
 }
 
+template <typename T>
+constexpr __host__ __device__ T clamp(const T& n, const T& lower, const T& upper) 
+{
+  return max(lower, min(n, upper));
+}
+template <typename T>
+constexpr __host__ __device__ T iclamp(const T& n, const T& e) 
+{
+  return max(e, std::abs(n)) * signum(n);
+}
+
 struct relative_height_from_normals
 {
   using vec2 = thrust::tuple<real, real>;
@@ -292,11 +304,13 @@ struct relative_height_from_normals
   __host__ __device__ real operator()(const vec2& n1, const vec2& n2) const
     noexcept
   {
-    real x = n1.get<0>() - n2.get<0>();
-    const real y = n1.get<1>() - n2.get<1>();
-    const float epsilon = 0.00000001f;
-    x = max(epsilon, std::abs(x)) * signum(x);
-    return y / x;
+    constexpr real epsilon = 0.00000001f;
+    const real x = iclamp(n2.get<0>() - n1.get<0>(), epsilon);
+    const real y = iclamp(n2.get<1>() - n1.get<1>(), epsilon);
+    const real q = std::abs(y / x);
+    return n1.get<0>() > n2.get<0>() ? -q : q;
+    //constexpr float bound = 10.f;
+    //return clamp(y / x, -bound, bound);
   }
 };
 
@@ -336,9 +350,10 @@ void build_Q_values(cusp::array2d<real, cusp::device_memory>::view di_normals,
                         n1.get<0>() = i_n1.get<1>();
                         n2.get<0>() = i_n2.get<1>();
                       }
-                      const int sign =
-                        (i_n1.get<3>() >= i_n2.get<3>()) ? 1.f : -1.f;
-                      return relative_height_from_normals{}(n1, n2) * sign;
+                      const real q = relative_height_from_normals{}(n1, n2);
+                      //if ((i_n1.get<3>() == 1 || i_n1.get<3>() == 0) && (i_n2.get<3>() == 1 || i_n2.get<3>() == 0))
+                      //  printf("%d %d %f\n", i_n1.get<3>(), i_n2.get<3>(), q);
+                      return q;
                     });
 }
 
@@ -374,7 +389,7 @@ void build_poisson_b(
 
 int main(int argc, char* argv[])
 {
-  assert(argc >= 3);
+  assert(argc >= 5);
   auto h_image = stbi::loadf(argv[1], 3);
   printf("Loaded image with dim: %dx%dx%d\n",
          h_image.width(),
@@ -446,8 +461,8 @@ int main(int argc, char* argv[])
   thrust::multiplies<real> op;
   thrust::transform(
     cyclic_Si, cyclic_Si + nnormals * 3, cyclic_L, d_b.begin(), op);
+  printf("b has been built %dx%d\n", d_b.size(), 1);
   cusp::print(d_b.subarray(0, 25));
-  cusp::print(d_shading_intensity.subarray(0, 25));
 
   // Now we can solve for the relative normals via SOR
   cusp::array1d<real, cusp::device_memory> d_x(3 * nnormals, 1.f);
@@ -455,15 +470,11 @@ int main(int argc, char* argv[])
     d_x.begin(), d_x.end(), [=] __host__ __device__(int x) -> real {
       return x >= nnormals * 2;
     });
+  cusp::print(d_x.subarray(0, 10));
+  cusp::print(d_x.subarray(nnormals, 10));
+  cusp::print(d_x.subarray(nnormals*2, 10));
 #if 1
   {
-    cusp::precond::diagonal<real, cusp::device_memory> M(d_A);
-    cusp::monitor<real> monitor(d_b, 2000, 1e-4, 0, true);
-    cusp::krylov::cg(d_A, d_x, d_b, monitor, M);
-    auto norm_begin = detail::zip_it(
-      d_x.begin(), d_x.begin() + nnormals, d_x.begin() + nnormals * 2);
-    auto norm_end = norm_begin + nnormals;
-
     using vec3 = thrust::tuple<real, real, real>;
     const auto normalize_vec = [] __host__ __device__(vec3 normal) {
       const real rlen =
@@ -471,15 +482,24 @@ int main(int argc, char* argv[])
                         sqr(normal.get<2>()));
       normal.get<0>() *= rlen;
       normal.get<1>() *= rlen;
-      normal.get<2>() *= rlen;  // std::abs(normal.get<2>() * rlen);
+      normal.get<2>() = std::abs(normal.get<2>() * rlen);
       return normal;
     };
+    auto norm_begin = detail::zip_it(
+      d_x.begin(), d_x.begin() + nnormals, d_x.begin() + nnormals * 2);
+    auto norm_end = norm_begin + nnormals;
+
+    cusp::precond::diagonal<real, cusp::device_memory> M(d_A);
+    cusp::monitor<real> monitor(d_b, 2000, 1e-4, 0, true);
+    thrust::transform(norm_begin, norm_end, norm_begin, normalize_vec);
+    cusp::krylov::cg(d_A, d_x, d_b, monitor, M);
+
     thrust::transform(norm_begin, norm_end, norm_begin, normalize_vec);
   }
 #else
   {
-    // cusp::relaxation::sor<real, cusp::device_memory> M(d_A, 2.0f);
-    cusp::relaxation::jacobi<float, cusp::device_memory> M(d_A);
+    cusp::relaxation::sor<real, cusp::device_memory> M(d_A, 1.0f);
+    //cusp::relaxation::jacobi<float, cusp::device_memory> M(d_A);
     cusp::array1d<real, cusp::device_memory> d_r(nnormals * 3, 1.f);
 
     auto norm_begin = detail::zip_it(
@@ -493,7 +513,7 @@ int main(int argc, char* argv[])
                         sqr(normal.get<2>()));
       normal.get<0>() *= rlen;
       normal.get<1>() *= rlen;
-      normal.get<2>() *= rlen;  // std::abs(normal.get<2>() * rlen);
+      normal.get<2>() = std::abs(normal.get<2>() * rlen);
       return normal;
     };
     const auto normalize_all = [=] __host__ __device__ {
@@ -511,11 +531,11 @@ int main(int argc, char* argv[])
     {
       M(d_A, d_b, d_x);
       // Normalize
-      normalize_all();
       // Compute the residual
       cusp::multiply(d_A, d_x, d_r);
       cusp::blas::axpy(d_b, d_r, -1.f);
     }
+      normalize_all();
   }
 #endif
   printf("Done\n");
@@ -523,6 +543,9 @@ int main(int argc, char* argv[])
     3, nnormals, nnormals, cusp::make_array1d_view(d_x), cusp::row_major{});
   make_host_image(d_relative_normals, h_image.get());
   stbi::writef("relative_normals.png", h_image);
+  cusp::print(d_x.subarray(0, 10));
+  cusp::print(d_x.subarray(nnormals, 10));
+  cusp::print(d_x.subarray(nnormals*2, 10));
 
 #if 1
   // Now that we have relative normals, we calculate the relative heights
@@ -532,6 +555,8 @@ int main(int argc, char* argv[])
   cusp::gallery::grid2d(d_Q, width, height);
   build_Q_values(d_relative_normals, d_Q);
   cusp::print(d_Q.values.subarray(0, 20));
+  cusp::print(d_Q.row_indices.subarray(0, 20));
+  cusp::print(d_Q.column_indices.subarray(0, 20));
 
   // Now we can assemble a poisson problem to solve the absolute heights
   cusp::array1d<real, cusp::device_memory> d_pb(nnormals);
@@ -540,6 +565,7 @@ int main(int argc, char* argv[])
                         d_Q.values.begin(),
                         thrust::make_discard_iterator(),
                         d_pb.begin());
+  printf("pb: \n");
   cusp::print(d_pb.subarray(0, 20));
 
   // The A matrix
@@ -572,7 +598,7 @@ int main(int argc, char* argv[])
   // Need to replace any references to the final solution with constants in b
   d_pA.values.begin()[3] = 0.f;
   d_pA.values.begin()[4 * width - 2] = 0.f;
-  d_pb[0] = 1.f;
+  //d_pb[0] = 1.f;
   d_pb.begin()[1] += d_pb[0];
   d_pb.begin()[width] += d_pb[0];
 
@@ -581,7 +607,7 @@ int main(int argc, char* argv[])
 #if 1
   {
     cusp::precond::diagonal<real, cusp::device_memory> M(d_pA);
-    cusp::monitor<real> monitor(d_pb, 25, 1e-4, 0, true);
+    cusp::monitor<real> monitor(d_pb, std::stoi(argv[5]), 1e-4, 0, true);
     cusp::krylov::cg(d_pA, d_h, d_pb, monitor, M);
   }
 #else
