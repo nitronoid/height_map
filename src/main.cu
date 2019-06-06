@@ -14,6 +14,7 @@
 
 #include "stbi_raii.hpp"
 #include <cub/cub.cuh>
+#include <cusp/transpose.h>
 #include <cusp/gallery/grid.h>
 #include <cusp/gallery/poisson.h>
 #include <cusp/print.h>
@@ -21,6 +22,7 @@
 #include <cusp/relaxation/sor.h>
 #include <cusp/relaxation/jacobi.h>
 #include <cusp/krylov/cg.h>
+#include <cusp/krylov/bicgstab.h>
 #include <cusp/linear_operator.h>
 #include <cusp/precond/diagonal.h>
 #include <cusp/monitor.h>
@@ -30,6 +32,72 @@
 #include "zip_it.cuh"
 #include "cycle_iterator.cuh"
 using real = float;
+
+void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
+{
+  if (code != cudaSuccess)
+  {
+    fprintf(
+      stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+    if (abort)
+    {
+      exit(code);
+    }
+  }
+}
+
+void gpuErrchk(cudaError_t ans)
+{
+  gpuAssert((ans), __FILE__, __LINE__);
+}
+static const char* _cusparseGetErrorEnum(cusparseStatus_t error)
+{
+  switch (error)
+  {
+  case CUSPARSE_STATUS_SUCCESS: return "CUSPARSE_STATUS_SUCCESS";
+
+  case CUSPARSE_STATUS_NOT_INITIALIZED:
+    return "CUSPARSE_STATUS_NOT_INITIALIZED";
+
+  case CUSPARSE_STATUS_ALLOC_FAILED: return "CUSPARSE_STATUS_ALLOC_FAILED";
+
+  case CUSPARSE_STATUS_INVALID_VALUE: return "CUSPARSE_STATUS_INVALID_VALUE";
+
+  case CUSPARSE_STATUS_ARCH_MISMATCH: return "CUSPARSE_STATUS_ARCH_MISMATCH";
+
+  case CUSPARSE_STATUS_MAPPING_ERROR: return "CUSPARSE_STATUS_MAPPING_ERROR";
+
+  case CUSPARSE_STATUS_EXECUTION_FAILED:
+    return "CUSPARSE_STATUS_EXECUTION_FAILED";
+
+  case CUSPARSE_STATUS_INTERNAL_ERROR: return "CUSPARSE_STATUS_INTERNAL_ERROR";
+
+  case CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED:
+    return "CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED";
+
+  case CUSPARSE_STATUS_ZERO_PIVOT: return "CUSPARSE_STATUS_ZERO_PIVOT";
+  }
+
+  return "<unknown>";
+}
+inline void
+__cusparseSafeCall(cusparseStatus_t err, const char* file, const int line)
+{
+  if (CUSPARSE_STATUS_SUCCESS != err)
+  {
+    fprintf(stderr,
+            "CUSPARSE error in file '%s', line %d, error %s\nterminating!\n",
+            __FILE__,
+            __LINE__,
+            _cusparseGetErrorEnum(err));
+    assert(0);
+  }
+}
+
+extern "C" void cusparseSafeCall(cusparseStatus_t err)
+{
+  __cusparseSafeCall(err, __FILE__, __LINE__);
+}
 
 template <typename T>
 constexpr T sqr(T val) noexcept
@@ -100,75 +168,100 @@ cusparse_add(cusp::coo_matrix<int, real, cusp::device_memory>::const_view di_A,
   cusp::indices_to_offsets(di_B.row_indices, B_row_offsets);
 
   cusparseHandle_t handle;
-  cusparseCreate(&handle);
+  cusparseSafeCall(cusparseCreate(&handle));
 
   cusparseMatDescr_t A_description;
-  cusparseCreateMatDescr(&A_description);
+  cusparseSafeCall(cusparseCreateMatDescr(&A_description));
   cusparseMatDescr_t B_description;
-  cusparseCreateMatDescr(&B_description);
+  cusparseSafeCall(cusparseCreateMatDescr(&B_description));
   cusparseMatDescr_t C_description;
-  cusparseCreateMatDescr(&C_description);
-
-  cusparseSetMatType(A_description, CUSPARSE_MATRIX_TYPE_GENERAL);
-  cusparseSetMatIndexBase(A_description, CUSPARSE_INDEX_BASE_ZERO);
-  cusparseSetMatType(B_description, CUSPARSE_MATRIX_TYPE_GENERAL);
-  cusparseSetMatIndexBase(B_description, CUSPARSE_INDEX_BASE_ZERO);
-  cusparseSetMatType(C_description, CUSPARSE_MATRIX_TYPE_GENERAL);
-  cusparseSetMatIndexBase(C_description, CUSPARSE_INDEX_BASE_ZERO);
+  cusparseSafeCall(cusparseCreateMatDescr(&C_description));
 
   // Coefficients
   const real alpha = 1.f;
-  const real beta = 0.001f * 2.f;
+  const real beta = 0.00001f * 2.f;
 
+  int C_base, C_nnz;
   // Not sure if this is needed
-  cusparseSetPointerMode(handle, CUSPARSE_POINTER_MODE_HOST);
-  // Compute the workspace size for the sparse matrix add
-  int C_nnz = 0;
-  // &C_nnz points to a host variable
-
+  int* nnz_total = &C_nnz;
+  cusparseSafeCall(cusparseSetPointerMode(handle, CUSPARSE_POINTER_MODE_HOST));
   cusp::array1d<int, cusp::device_memory> C_row_offsets(di_A.num_rows + 1);
 
-  cusparseXcsrgeamNnz(handle,
-                      di_A.num_rows,
-                      di_A.num_cols,
-                      A_description,
-                      di_A.num_entries,
-                      A_row_offsets.begin().base().get(),
-                      di_A.column_indices.begin().base().get(),
-                      B_description,
-                      di_B.num_entries,
-                      B_row_offsets.begin().base().get(),
-                      di_B.column_indices.begin().base().get(),
-                      C_description,
-                      C_row_offsets.begin().base().get(),
-                      &C_nnz);
-  C_nnz = C_row_offsets[di_A.num_rows] - C_row_offsets[0];
+  cusparseSafeCall(cusparseXcsrgeamNnz(handle,
+                                       di_A.num_rows,
+                                       di_A.num_cols,
+                                       A_description,
+                                       di_A.num_entries,
+                                       A_row_offsets.begin().base().get(),
+                                       di_A.column_indices.begin().base().get(),
+                                       B_description,
+                                       di_B.num_entries,
+                                       B_row_offsets.begin().base().get(),
+                                       di_B.column_indices.begin().base().get(),
+                                       C_description,
+                                       C_row_offsets.begin().base().get(),
+                                       nnz_total));
+  if (nnz_total != NULL)
+  {
+    C_nnz = *nnz_total;
+  }
+  else
+  {
+    C_nnz = C_row_offsets.back();
+    C_nnz -= C_row_offsets[0];
+  }
 
   cusp::csr_matrix<int, real, cusp::device_memory> do_C(
     di_A.num_rows, di_A.num_cols, C_nnz);
   do_C.row_offsets = std::move(C_row_offsets);
 
   // Now actually do the add
-  cusparseScsrgeam(handle,
-                   di_A.num_rows,
-                   di_A.num_cols,
-                   &alpha,
-                   A_description,
-                   di_A.num_entries,
-                   di_A.values.begin().base().get(),
-                   A_row_offsets.begin().base().get(),
-                   di_A.column_indices.begin().base().get(),
-                   &beta,
-                   B_description,
-                   di_B.num_entries,
-                   di_B.values.begin().base().get(),
-                   B_row_offsets.begin().base().get(),
-                   di_B.column_indices.begin().base().get(),
-                   C_description,
-                   do_C.values.begin().base().get(),
-                   do_C.row_offsets.begin().base().get(),
-                   do_C.column_indices.begin().base().get());
+  cusparseSafeCall(cusparseScsrgeam(handle,
+                                    di_A.num_rows,
+                                    di_A.num_cols,
+                                    &alpha,
+                                    A_description,
+                                    di_A.num_entries,
+                                    di_A.values.begin().base().get(),
+                                    A_row_offsets.begin().base().get(),
+                                    di_A.column_indices.begin().base().get(),
+                                    &beta,
+                                    B_description,
+                                    di_B.num_entries,
+                                    di_B.values.begin().base().get(),
+                                    B_row_offsets.begin().base().get(),
+                                    di_B.column_indices.begin().base().get(),
+                                    C_description,
+                                    do_C.values.begin().base().get(),
+                                    do_C.row_offsets.begin().base().get(),
+                                    do_C.column_indices.begin().base().get()));
   return do_C;
+}
+
+void check_symmetry(
+  cusp::csr_matrix<int, real, cusp::device_memory>::const_view di_M)
+{
+  // Copy to host
+  cusp::csr_matrix<int, real, cusp::host_memory> M = di_M;
+  // Transpose
+  cusp::csr_matrix<int, real, cusp::host_memory> MT(
+    M.num_cols, M.num_rows, M.num_entries);
+  cusp::transpose(M, MT);
+
+  printf("Checking for symmetry\n");
+
+  for (int i = 0; i < di_M.num_entries; ++i)
+  {
+    const real value = M.values[i];
+    const real valueT = MT.values[i];
+    if (value != valueT)
+    {
+      printf("BAD symmetry at: %d with value: %f and value^T: %f\n",
+             i,
+             value,
+             valueT);
+    }
+  }
 }
 
 void build_M(float3 L,
@@ -218,6 +311,20 @@ void build_M(float3 L,
                     [=] __host__ __device__(int s, int r) {
                       return (r % nnormals) + s * nnormals;
                     });
+
+  using tup3 = thrust::tuple<int, int, real>;
+  const auto inc_diag = [=] __host__ __device__(tup3 entry) {
+    // Add one to the diagonals
+    if (entry.get<0>() == entry.get<1>())
+    {
+      entry.get<2>() += 1;
+    }
+    return entry;
+  };
+  auto entry_it = detail::zip_it(
+    do_M.row_indices.begin(), do_M.column_indices.begin(), do_M.values.begin());
+  // Fix the boundary cell diagonals
+  thrust::transform(entry_it, entry_it + nnormals*3, entry_it, inc_diag);
 }
 
 void build_B(const int m,
@@ -276,6 +383,19 @@ constexpr __host__ __device__ real signum(T val)
   return (T(0) <= val) - (val < T(0));
 }
 
+template <typename T>
+constexpr __host__ __device__ T clamp(const T& n,
+                                      const T& lower,
+                                      const T& upper)
+{
+  return max(lower, min(n, upper));
+}
+template <typename T>
+constexpr __host__ __device__ T iclamp(const T& n, const T& e)
+{
+  return max(e, std::abs(n)) * signum(n);
+}
+
 struct relative_height_from_normals
 {
   using vec2 = thrust::tuple<real, real>;
@@ -293,11 +413,25 @@ struct relative_height_from_normals
   __host__ __device__ real operator()(const vec2& n1, const vec2& n2) const
     noexcept
   {
-    real x = n1.get<0>() - n2.get<0>();
+    constexpr real epsilon = 0.000000001f;
+    const real x = n1.get<0>() - n2.get<0>();
     const real y = n1.get<1>() - n2.get<1>();
-    const float epsilon = 0.00000001f;
-    x = max(epsilon, std::abs(x)) * signum(x);
-    return y / x;
+    // Guard against division by zero
+    const real q = std::abs(x) < epsilon ? x : std::abs(y / x);
+
+    constexpr real inf = std::numeric_limits<real>::infinity();
+    const real g1 =
+      n1.get<1>() == 0.f ? inf : std::abs(n1.get<1>() / n1.get<0>());
+    const real g2 =
+      n2.get<1>() == 0.f ? inf : std::abs(n2.get<1>() / n2.get<0>());
+    // const real g1 =
+    //  std::abs(n1.get<1>()) < epsilon ? inf : n1.get<1>() / n1.get<0>();
+    // const real g2 =
+    //  std::abs(n2.get<1>()) < epsilon ? inf : n2.get<1>() / n2.get<0>();
+
+    return g1 > g2 ? -q : q;
+    // constexpr float bound = 10.f;
+    // return clamp(y / x, -bound, bound);
   }
 };
 
@@ -357,9 +491,11 @@ void build_Q_values(cusp::array2d<real, cusp::device_memory>::view di_normals,
                         n1.get<0>() = i_n1.get<1>();
                         n2.get<0>() = i_n2.get<1>();
                       }
-                      const int sign =
-                        (i_n1.get<3>() >= i_n2.get<3>()) ? 1.f : -1.f;
-                      return relative_height_from_normals{}(n1, n2) * sign;
+                      const real q = relative_height_from_normals{}(n1, n2);
+                      // if ((i_n1.get<3>() == 1 || i_n1.get<3>() == 0) &&
+                      // (i_n2.get<3>() == 1 || i_n2.get<3>() == 0))
+                      //  printf("%d %d %f\n", i_n1.get<3>(), i_n2.get<3>(), q);
+                      return q;
                     });
 }
 
@@ -395,7 +531,7 @@ void build_poisson_b(
 
 int main(int argc, char* argv[])
 {
-  assert(argc >= 3);
+  assert(argc >= 5);
   auto h_image = stbi::loadf(argv[1], 3);
   printf("Loaded image with dim: %dx%dx%d\n",
          h_image.width(),
@@ -418,17 +554,18 @@ int main(int argc, char* argv[])
   cusp::array2d<real, cusp::device_memory> d_image(h_image.n_channels(),
                                                    h_image.n_pixels());
   make_device_image(h_image.get(), d_image);
-  //thrust::transform(d_image.values.begin(),
+  // thrust::transform(d_image.values.begin(),
   //                  d_image.values.end(),
   //                  d_image.values.begin(),
   //                  [] __host__ __device__(real x) {
   //                    return min(max(x, 1.f / 255.f), 254.f / 255.f);
   //                  });
-  cusp::array1d<real, cusp::device_memory> d_shading_intensity(h_image.n_pixels());
+  cusp::array1d<real, cusp::device_memory> d_shading_intensity(
+    h_image.n_pixels());
   cusp::io::read_matrix_market_file(d_shading_intensity, "shading.mtx");
   cusp::print(d_shading_intensity.subarray(0, 10));
   print_range_avg(d_shading_intensity);
-  //normalize(d_shading_intensity);
+  // normalize(d_shading_intensity);
   print_range_avg(d_shading_intensity);
 
   const int width = h_image.width();
@@ -441,12 +578,16 @@ int main(int argc, char* argv[])
   build_M(L, d_M);
   printf("M has been built %dx%d\n", d_M.num_rows, d_M.num_cols);
   cusp::print(d_M.values.subarray(0, 10));
+  cusp::print(d_M.row_indices.subarray(0, 10));
+  cusp::print(d_M.column_indices.subarray(0, 10));
 
   // B is our pixel 4-neighborhood adjacency matrix
   cusp::coo_matrix<int, real, cusp::device_memory> d_B(
     nnormals * 3, nnormals * 3, 3 * (height * (5 * width - 2) - 2 * width));
   build_B(height, width, d_B);
   printf("B has been built %dx%d\n", d_B.num_rows, d_B.num_cols);
+  cusp::print(d_B.row_indices.subarray(0, 10));
+  cusp::print(d_B.column_indices.subarray(0, 10));
   // cusp::print(d_B);
 
   // Now we build A using M and B
@@ -455,6 +596,10 @@ int main(int argc, char* argv[])
   // Now we can add M
   auto d_A = cusparse_add(d_M, d_B);
   printf("A has been built %dx%d\n", d_A.num_rows, d_A.num_cols);
+  cusp::print(d_A.values.subarray(0, 10));
+  check_symmetry(d_A);
+  cusp::print(d_A.row_offsets.subarray(0, 10));
+  cusp::print(d_A.column_indices.subarray(0, 10));
 
   // The b vector of the system is (shading intensity * L), where L repeats
   // Copy L to the device
@@ -471,24 +616,17 @@ int main(int argc, char* argv[])
   thrust::multiplies<real> op;
   thrust::transform(
     cyclic_Si, cyclic_Si + nnormals * 3, cyclic_L, d_b.begin(), op);
+  printf("b has been built %dx%d\n", d_b.size(), 1);
   cusp::print(d_b.subarray(0, 25));
-  cusp::print(d_shading_intensity.subarray(0, 25));
 
   // Now we can solve for the relative normals via SOR
   cusp::array1d<real, cusp::device_memory> d_x(3 * nnormals, 1.f);
   thrust::tabulate(
-    d_x.begin(), d_x.end(), [=] __host__ __device__(int x) -> real {
-      return x >= nnormals * 2;
-    });
+   d_x.begin(), d_x.end(), [=] __host__ __device__(int x) -> real {
+     return x >= nnormals * 2;
+   });
 #if 0
   {
-    cusp::precond::diagonal<real, cusp::device_memory> M(d_A);
-    cusp::monitor<real> monitor(d_b, 2000, 1e-4, 0, true);
-    cusp::krylov::cg(d_A, d_x, d_b, monitor, M);
-    auto norm_begin = detail::zip_it(
-      d_x.begin(), d_x.begin() + nnormals, d_x.begin() + nnormals * 2);
-    auto norm_end = norm_begin + nnormals;
-
     using vec3 = thrust::tuple<real, real, real>;
     const auto normalize_vec = [] __host__ __device__(vec3 normal) {
       const real rlen =
@@ -496,16 +634,25 @@ int main(int argc, char* argv[])
                         sqr(normal.get<2>()));
       normal.get<0>() *= rlen;
       normal.get<1>() *= rlen;
-      normal.get<2>() *= rlen;  // std::abs(normal.get<2>() * rlen);
+      normal.get<2>() = std::abs(normal.get<2>() * rlen);
       return normal;
     };
+    auto norm_begin = detail::zip_it(
+      d_x.begin(), d_x.begin() + nnormals, d_x.begin() + nnormals * 2);
+    auto norm_end = norm_begin + nnormals;
+
+    cusp::precond::diagonal<real, cusp::device_memory> M(d_A);
+    cusp::monitor<real> monitor(d_b, 2000, 1e-4, 0, true);
+    thrust::transform(norm_begin, norm_end, norm_begin, normalize_vec);
+    cusp::krylov::cg(d_A, d_x, d_b, monitor, M);
+
     thrust::transform(norm_begin, norm_end, norm_begin, normalize_vec);
   }
 #else
   {
     cusp::relaxation::sor<real, cusp::device_memory> M(d_A, 1.0f);
-    //cusp::relaxation::jacobi<float, cusp::device_memory> M(d_A);
-    cusp::array1d<real, cusp::device_memory> d_r(nnormals * 3, 1.f);
+    // cusp::relaxation::jacobi<float, cusp::device_memory> M(d_A);
+    cusp::array1d<real, cusp::device_memory> d_r(nnormals * 3);
 
     auto norm_begin = detail::zip_it(
       d_x.begin(), d_x.begin() + nnormals, d_x.begin() + nnormals * 2);
@@ -530,16 +677,16 @@ int main(int argc, char* argv[])
     cusp::blas::axpy(d_b, d_r, -1.f);
 
     // Monitor the convergence
-    cusp::monitor<real> monitor(d_b, 5000, 1e-4, 0, true);
+    cusp::monitor<real> monitor(d_b, 20000, 1e-12, 0, true);
 
     for (; !monitor.finished(d_r); ++monitor)
     {
       M(d_A, d_b, d_x);
-      // Normalize
       // Compute the residual
       cusp::multiply(d_A, d_x, d_r);
       cusp::blas::axpy(d_b, d_r, -1.f);
     }
+      // Normalize
       normalize_all();
   }
 #endif
@@ -548,8 +695,11 @@ int main(int argc, char* argv[])
     3, nnormals, nnormals, cusp::make_array1d_view(d_x), cusp::row_major{});
   make_host_image(d_relative_normals, h_image.get());
   stbi::writef("relative_normals.png", h_image);
+  cusp::print(d_x.subarray(0, 10));
+  cusp::print(d_x.subarray(nnormals, 10));
+  cusp::print(d_x.subarray(nnormals * 2, 10));
 
-#if 1
+#if 0
   // Now that we have relative normals, we calculate the relative heights
   cusp::coo_matrix<int, real, cusp::device_memory> d_Q(
     nnormals, nnormals, height * (4 * width - 2) - 2 * width);
@@ -557,6 +707,8 @@ int main(int argc, char* argv[])
   cusp::gallery::grid2d(d_Q, width, height);
   build_Q_values(d_relative_normals, d_Q);
   cusp::print(d_Q.values.subarray(0, 20));
+  cusp::print(d_Q.row_indices.subarray(0, 20));
+  cusp::print(d_Q.column_indices.subarray(0, 20));
 
   // Now we can assemble a poisson problem to solve the absolute heights
   cusp::array1d<real, cusp::device_memory> d_pb(nnormals);
@@ -565,6 +717,7 @@ int main(int argc, char* argv[])
                         d_Q.values.begin(),
                         thrust::make_discard_iterator(),
                         d_pb.begin());
+  printf("pb: \n");
   cusp::print(d_pb.subarray(0, 20));
 
   // The A matrix
@@ -597,16 +750,16 @@ int main(int argc, char* argv[])
   // Need to replace any references to the final solution with constants in b
   d_pA.values.begin()[3] = 0.f;
   d_pA.values.begin()[4 * width - 2] = 0.f;
-  d_pb[0] = 1.f;
+  //d_pb[0] = 1.f;
   d_pb.begin()[1] += d_pb[0];
   d_pb.begin()[width] += d_pb[0];
 
   cusp::array1d<real, cusp::device_memory> d_h(nnormals, 1.f);
   d_h[0] = d_pb[0];
-#if 1
+#if 0
   {
     cusp::precond::diagonal<real, cusp::device_memory> M(d_pA);
-    cusp::monitor<real> monitor(d_pb, 25, 1e-4, 0, true);
+    cusp::monitor<real> monitor(d_pb, std::stoi(argv[5]), 1e-4, 0, true);
     cusp::krylov::cg(d_pA, d_h, d_pb, monitor, M);
   }
 #else
@@ -620,7 +773,7 @@ int main(int argc, char* argv[])
     cusp::relaxation::jacobi<real, cusp::device_memory> M(pA);
     cusp::array1d<real, cusp::device_memory> d_r(nnormals, 1.f);
     // Monitor the convergence
-    cusp::monitor<real> monitor(d_pb, 500, 1e-4, 0, true);
+    cusp::monitor<real> monitor(d_pb, std::stoi(argv[5]), 1e-4, 0, true);
     cusp::multiply(pA, d_h, d_r);
     cusp::blas::axpy(d_pb, d_r, -1.f);
 
