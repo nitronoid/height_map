@@ -24,6 +24,7 @@
 #include <cusp/linear_operator.h>
 #include <cusp/precond/diagonal.h>
 #include <cusp/monitor.h>
+#include <cusp/io/matrix_market.h>
 
 #include "matrix_functional.cuh"
 #include "zip_it.cuh"
@@ -300,6 +301,26 @@ struct relative_height_from_normals
   }
 };
 
+void normalize(cusp::array1d<real, cusp::device_memory>::view dio_v)
+{
+  // Subtract the minimum value
+  const real min = *thrust::min_element(dio_v.begin(), dio_v.end());
+  const detail::unary_minus<real> subf(min);
+  thrust::transform(dio_v.begin(), dio_v.end(), dio_v.begin(), subf);
+  // Divide by the maximum value
+  const real scale = 1.f / *thrust::max_element(dio_v.begin(), dio_v.end());
+  const detail::unary_multiplies<real> mulf(scale);
+  thrust::transform(dio_v.begin(), dio_v.end(), dio_v.begin(), mulf);
+}
+
+void print_range_avg(cusp::array1d<real, cusp::device_memory>::const_view di_v)
+{
+  const real min = *thrust::min_element(di_v.begin(), di_v.end());
+  const real max = *thrust::max_element(di_v.begin(), di_v.end());
+  const real avg = thrust::reduce(di_v.begin(), di_v.end()) / di_v.size();
+  std::cout << "min: " << min << ", max: " << max << ", avg: " << avg << '\n';
+}
+
 void build_Q_values(cusp::array2d<real, cusp::device_memory>::view di_normals,
                     cusp::coo_matrix<int, real, cusp::device_memory>::view do_Q)
 {
@@ -385,7 +406,7 @@ int main(int argc, char* argv[])
   const real polar = std::stof(argv[3]) * M_PI / 180.0f;
   // Lighting direction
   float3 L{std::stof(argv[2]), std::stof(argv[3]), std::stof(argv[4])};
-  //float3 L{std::sin(polar) * std::cos(azimuth),
+  // float3 L{std::sin(polar) * std::cos(azimuth),
   //         std::sin(polar) * std::sin(azimuth),
   //         std::cos(polar)};
   const real L_rlen = 1.f / std::sqrt(L.x * L.x + L.y * L.y + L.z * L.z);
@@ -397,14 +418,18 @@ int main(int argc, char* argv[])
   cusp::array2d<real, cusp::device_memory> d_image(h_image.n_channels(),
                                                    h_image.n_pixels());
   make_device_image(h_image.get(), d_image);
-  thrust::transform(d_image.values.begin(),
-                    d_image.values.end(),
-                    d_image.values.begin(),
-                    [] __host__ __device__(real x) {
-                      return min(max(x, 1.f / 255.f), 254.f / 255.f);
-                    });
-  // Pick any channel as the intensity (should all be equal)
-  auto d_shading_intensity = d_image.row(0);
+  //thrust::transform(d_image.values.begin(),
+  //                  d_image.values.end(),
+  //                  d_image.values.begin(),
+  //                  [] __host__ __device__(real x) {
+  //                    return min(max(x, 1.f / 255.f), 254.f / 255.f);
+  //                  });
+  cusp::array1d<real, cusp::device_memory> d_shading_intensity(h_image.n_pixels());
+  cusp::io::read_matrix_market_file(d_shading_intensity, "shading.mtx");
+  cusp::print(d_shading_intensity.subarray(0, 10));
+  print_range_avg(d_shading_intensity);
+  //normalize(d_shading_intensity);
+  print_range_avg(d_shading_intensity);
 
   const int width = h_image.width();
   const int height = h_image.height();
@@ -455,7 +480,7 @@ int main(int argc, char* argv[])
     d_x.begin(), d_x.end(), [=] __host__ __device__(int x) -> real {
       return x >= nnormals * 2;
     });
-#if 1
+#if 0
   {
     cusp::precond::diagonal<real, cusp::device_memory> M(d_A);
     cusp::monitor<real> monitor(d_b, 2000, 1e-4, 0, true);
@@ -478,8 +503,8 @@ int main(int argc, char* argv[])
   }
 #else
   {
-    // cusp::relaxation::sor<real, cusp::device_memory> M(d_A, 2.0f);
-    cusp::relaxation::jacobi<float, cusp::device_memory> M(d_A);
+    cusp::relaxation::sor<real, cusp::device_memory> M(d_A, 1.0f);
+    //cusp::relaxation::jacobi<float, cusp::device_memory> M(d_A);
     cusp::array1d<real, cusp::device_memory> d_r(nnormals * 3, 1.f);
 
     auto norm_begin = detail::zip_it(
@@ -493,7 +518,7 @@ int main(int argc, char* argv[])
                         sqr(normal.get<2>()));
       normal.get<0>() *= rlen;
       normal.get<1>() *= rlen;
-      normal.get<2>() *= rlen;  // std::abs(normal.get<2>() * rlen);
+      normal.get<2>() = std::abs(normal.get<2>() * rlen);
       return normal;
     };
     const auto normalize_all = [=] __host__ __device__ {
@@ -511,11 +536,11 @@ int main(int argc, char* argv[])
     {
       M(d_A, d_b, d_x);
       // Normalize
-      normalize_all();
       // Compute the residual
       cusp::multiply(d_A, d_x, d_r);
       cusp::blas::axpy(d_b, d_r, -1.f);
     }
+      normalize_all();
   }
 #endif
   printf("Done\n");
@@ -617,14 +642,8 @@ int main(int argc, char* argv[])
          (real)d_Q.values[3],
          (real)d_Q.values[4]);
 
-  const real min = *thrust::min_element(d_h.begin(), d_h.end());
-  const real max = *thrust::max_element(d_h.begin(), d_h.end());
-  const real avg = thrust::reduce(d_h.begin(), d_h.end()) / nnormals;
-  std::cout << "min: " << min << ", max: " << max << ", avg: " << avg << '\n';
-  thrust::transform(
-    d_h.begin(), d_h.end(), d_h.begin(), detail::unary_minus<real>(min));
-  const real scale = 1.f / *thrust::max_element(d_h.begin(), d_h.end());
-  cusp::blas::scal(d_h, scale);
+  print_range_avg(d_h);
+  normalize(d_h);
 
   const auto h_out = detail::zip_it(d_h.begin(), d_h.begin(), d_h.begin());
   const auto rn_begin = detail::zip_it(d_relative_normals.row(0).begin(),
@@ -635,8 +654,5 @@ int main(int argc, char* argv[])
   make_host_image(d_relative_normals, h_image.get());
   stbi::writef("height.png", h_image);
 #endif
-
-  make_host_image(d_image, h_image.get());
-  stbi::writef("out.png", h_image);
 }
 
