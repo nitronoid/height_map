@@ -179,7 +179,7 @@ cusparse_add(cusp::coo_matrix<int, real, cusp::device_memory>::const_view di_A,
 
   // Coefficients
   const real alpha = 1.f;
-  const real beta = 0.001f * 2.f;
+  const real beta = 0.1f * 2.f;
 
   int C_base, C_nnz;
   // Not sure if this is needed
@@ -324,7 +324,7 @@ void build_M(float3 L,
   auto entry_it = detail::zip_it(
     do_M.row_indices.begin(), do_M.column_indices.begin(), do_M.values.begin());
   // Fix the boundary cell diagonals
-  //thrust::transform(entry_it, entry_it + nnormals*3, entry_it, inc_diag);
+  // thrust::transform(entry_it, entry_it + nnormals*3, entry_it, inc_diag);
 }
 
 void build_B(const int m,
@@ -416,61 +416,36 @@ struct relative_height_from_normals
     return thrust::make_tuple(n.get<0>() / norm, n.get<1>() / norm);
   }
 
-  __host__ __device__ real operator()(vec2 n1, vec2 n2, bool debug = false) const
-    noexcept
+  __host__ __device__ real operator()(vec2 n1,
+                                      vec2 n2,
+                                      bool debug = false) const noexcept
   {
     // Normalize n1 and n2
     n1 = normalize(n1);
     n2 = normalize(n2);
-#if 0
-
-    const real theta = std::acos(dot(n1, n2));
-    const real gamma = (real(M_PI) - theta) * 0.5f;
-    const real delta = std::abs(std::atan(n1.get<1>() / n1.get<0>()));
-    const real alpha = gamma - delta;
-    const real q = std::tan(alpha);
-
-    return (n1.get<0>() > 0.f && n2.get<0>() < 0.f) ? -q : q;
-#else
-    const auto inf = std::numeric_limits<real>::infinity();
-
-    const real g1 =
-      n1.get<0>() == 0.f ? inf : std::abs(n1.get<1>() / n1.get<0>());
-    const real g2 = 
-      n2.get<0>() == 0.f ? inf : std::abs(n2.get<1>() / n2.get<0>());
-
     const real x = n1.get<0>() - n2.get<0>();
     const real y = n1.get<1>() - n2.get<1>();
 
-    if (debug)
-    {
-      printf("N1: [%.15f, %.15f]\n", n1.get<0>(), n1.get<1>());
-      printf("N2: [%.15f, %.15f]\n", n2.get<0>(), n2.get<1>());
-      printf("G1: %.15f, G2: %.15f\n", g1, g2);
-      printf("N: [%.15f, %.15f]\n", x, y);
-      printf("N.x == 0: %d\n", x == 0.f);
-    }
-
     real q;
-    constexpr float epsilon = 0.00001f;
+    constexpr float epsilon = 0.000001f;
     if (std::abs(x) > epsilon)
     {
-      if (debug)
-        printf("standard\n");
-      q = std::abs(y / x);
+      q = y / x;
     }
     else
     {
+      const auto inf = std::numeric_limits<real>::infinity();
+      const real g1 =
+        n1.get<0>() == 0.f ? inf : std::abs(n1.get<1>() / n1.get<0>());
       if (g1 == inf)
         q = 0.f;
       else if (g1 == 0.f)
-        q = 0.f; //inf
+        q = 0.f;  // inf
       else
         q = 1.f / g1;
     }
 
-    return g1 > g2 ? -q : q;
-#endif
+    return q;
   }
 };
 
@@ -530,43 +505,42 @@ void build_Q_values(cusp::array2d<real, cusp::device_memory>::view di_normals,
                         n1.get<0>() = i_n1.get<1>();
                         n2.get<0>() = i_n2.get<1>();
                       }
-                      bool print = i_n1.get<3>() == 0 && i_n2.get<3>() == 1;
-                      const real q = relative_height_from_normals{}(n1, n2, print);
-                      // if ((i_n1.get<3>() == 1 || i_n1.get<3>() == 0) &&
-                      // (i_n2.get<3>() == 1 || i_n2.get<3>() == 0))
-                      //  printf("%d %d %f\n", i_n1.get<3>(), i_n2.get<3>(), q);
-                      return q;
+                      // in lower triangle
+                      const bool lower = i_n1.get<3>() > i_n2.get<3>();
+                      const real q = relative_height_from_normals{}(n1, n2);
+                      return lower ? -q : q;
                     });
 }
 
-void build_poisson_b(
-  const int m,
-  const int n,
-  cusp::coo_matrix<int, real, cusp::device_memory>::const_view di_Q,
-  cusp::array1d<real, cusp::device_memory>::view do_b)
+void apply_sor(
+    cusp::csr_matrix<int, real, cusp::device_memory>::const_view di_A,
+    cusp::array1d<real, cusp::device_memory>::const_view di_b,
+    cusp::array1d<real, cusp::device_memory>::view do_x,
+    const real i_w,
+    const real i_tol,
+    const int i_max_iter,
+    const bool verbose)
 {
-  // Build I - M, essentially a Poisson, with 1 down the diagonal
-  cusp::coo_matrix<int, real, cusp::device_memory> d_temp;
-  cusp::gallery::poisson5pt(d_temp, n, m);
-  auto temp_begin = detail::zip_it(d_temp.row_indices.begin(),
-                                   d_temp.column_indices.begin(),
-                                   d_temp.values.begin());
-  using tup3 = thrust::tuple<int, int, real>;
-  thrust::transform(temp_begin,
-                    temp_begin + d_temp.num_entries,
-                    temp_begin,
-                    [=] __host__ __device__(tup3 entry) {
-                      // Fix boundary cell diagonals
-                      entry.get<2>() =
-                        (entry.get<1>() == entry.get<1>()) ? 1.f : -1.f;
-                      return entry;
-                    });
-  // SpMv (I - M) * O, where O is the vector of 0.5's
-  cusp::array1d<real, cusp::device_memory> d_O(do_b.size(), 0.5f);
-  cusp::multiply(d_temp, d_O, do_b);
-  // SpMv Q * ((I - M) * O)
-  thrust::copy(do_b.begin(), do_b.begin(), d_O.begin());
-  cusp::multiply(di_Q, d_O, do_b);
+  // Linear SOR operator
+  cusp::relaxation::sor<real, cusp::device_memory> M(di_A, i_w);
+  // Array to store the residual
+  cusp::array1d<real, cusp::device_memory> d_r(di_b.size());
+  // Compute the initial residual
+  const auto compute_residual = [&] __host__ {
+    cusp::multiply(di_A, do_x, d_r);
+    cusp::blas::axpy(di_b, d_r, -1.f);
+  };
+  compute_residual();
+  // Monitor the convergence
+  cusp::monitor<real> monitor(di_b, i_max_iter, i_tol, 0, verbose);
+  // Iterate until convergence criteria is met
+  for (; !monitor.finished(d_r); ++monitor)
+  {
+    // Apply the SOR linear operator to iterate on our solution
+    M(di_A, di_b, do_x);
+    // Compute the residual
+    compute_residual();
+  }
 }
 
 int main(int argc, char* argv[])
@@ -594,20 +568,12 @@ int main(int argc, char* argv[])
   cusp::array2d<real, cusp::device_memory> d_image(h_image.n_channels(),
                                                    h_image.n_pixels());
   make_device_image(h_image.get(), d_image);
-  // thrust::transform(d_image.values.begin(),
-  //                  d_image.values.end(),
-  //                  d_image.values.begin(),
-  //                  [] __host__ __device__(real x) {
-  //                    return min(max(x, 1.f / 255.f), 254.f / 255.f);
-  //                  });
-  //auto d_shading_intensity = d_image.row(0);
-  cusp::array1d<real, cusp::device_memory> d_shading_intensity(
-    h_image.n_pixels());
-  cusp::io::read_matrix_market_file(d_shading_intensity, "shading.mtx");
-  cusp::print(d_shading_intensity.subarray(0, 9));
-  print_range_avg(d_shading_intensity);
-  // normalize(d_shading_intensity);
-  print_range_avg(d_shading_intensity);
+  auto d_intensity = d_image.row(0);
+  cusp::blas::scal(d_intensity, 2.f);
+  // cusp::io::read_matrix_market_file(d_intensity, "shading.mtx");
+  print_range_avg(d_intensity);
+  // normalize(d_intensity);
+  print_range_avg(d_intensity);
 
   const int width = h_image.width();
   const int height = h_image.height();
@@ -618,18 +584,12 @@ int main(int argc, char* argv[])
     nnormals * 3, nnormals * 3, nnormals * 9);
   build_M(L, d_M);
   printf("M has been built %dx%d\n", d_M.num_rows, d_M.num_cols);
-  //cusp::print(d_M.values.subarray(0, 10));
-  //cusp::print(d_M.row_indices.subarray(0, 10));
-  //cusp::print(d_M.column_indices.subarray(0, 10));
 
   // B is our pixel 4-neighborhood adjacency matrix
   cusp::coo_matrix<int, real, cusp::device_memory> d_B(
     nnormals * 3, nnormals * 3, 3 * (height * (5 * width - 2) - 2 * width));
   build_B(height, width, d_B);
   printf("B has been built %dx%d\n", d_B.num_rows, d_B.num_cols);
-  //cusp::print(d_B.row_indices.subarray(0, 10));
-  //cusp::print(d_B.column_indices.subarray(0, 10));
-  // cusp::print(d_B);
 
   // Now we build A using M and B
   // A = M + 8lmI -2lmB <=> A = M + 2lm(4I - B)
@@ -637,10 +597,8 @@ int main(int argc, char* argv[])
   // Now we can add M
   auto d_A = cusparse_add(d_M, d_B);
   printf("A has been built %dx%d\n", d_A.num_rows, d_A.num_cols);
-  //cusp::print(d_A.values.subarray(0, 10));
+  // cusp::print(d_A.values.subarray(0, 10));
   check_symmetry(d_A);
-  //cusp::print(d_A.row_offsets.subarray(0, 10));
-  //cusp::print(d_A.column_indices.subarray(0, 10));
 
   // The b vector of the system is (shading intensity * L), where L repeats
   // Copy L to the device
@@ -648,108 +606,63 @@ int main(int argc, char* argv[])
   // Iterate over one component of L per channel of the normals
   const auto cyclic_L = thrust::make_permutation_iterator(
     d_L.begin(), detail::make_row_iterator(nnormals));
-  // Iterate over the shading intensity, cycling back for each channel
-  const auto cyclic_Si =
-    detail::make_cycle_iterator(d_shading_intensity.begin(), nnormals);
+  const thrust::multiplies<real> mul;
+  // Loop over for each dimension of the normals
+  const auto cyclic_i =
+    detail::make_cycle_iterator(d_intensity.begin(), nnormals);
   // Allocate the b vector
   cusp::array1d<real, cusp::device_memory> d_b(nnormals * 3);
-  // Multiply Si with L to get the resulting b vector
-  thrust::multiplies<real> op;
+  // Write the b vector
   thrust::transform(
-    cyclic_Si, cyclic_Si + nnormals * 3, cyclic_L, d_b.begin(), op);
+    cyclic_i, cyclic_i + nnormals * 3, cyclic_L, d_b.begin(), mul);
   printf("b has been built %dx%d\n", d_b.size(), 1);
-  //cusp::print(d_b.subarray(0, 25));
 
   // Now we can solve for the relative normals via SOR
   cusp::array1d<real, cusp::device_memory> d_x(3 * nnormals, 1.f);
   thrust::tabulate(
-   d_x.begin(), d_x.end(), [=] __host__ __device__(int x) -> real {
-     return x >= nnormals * 2;
-   });
-#if 0
+    d_x.begin(), d_x.end(), [=] __host__ __device__(int x) -> real {
+      return x >= nnormals * 2;
+    });
   {
-    using vec3 = thrust::tuple<real, real, real>;
-    const auto normalize_vec = [] __host__ __device__(vec3 normal) {
-      const real rlen =
-        1.f / std::sqrt(sqr(normal.get<0>()) + sqr(normal.get<1>()) +
-                        sqr(normal.get<2>()));
-      normal.get<0>() *= rlen;
-      normal.get<1>() *= rlen;
-      normal.get<2>() = std::abs(normal.get<2>() * rlen);
-      return normal;
-    };
-    auto norm_begin = detail::zip_it(
-      d_x.begin(), d_x.begin() + nnormals, d_x.begin() + nnormals * 2);
-    auto norm_end = norm_begin + nnormals;
-
-    cusp::precond::diagonal<real, cusp::device_memory> M(d_A);
-    cusp::monitor<real> monitor(d_b, 2000, 1e-8, 0, true);
-    thrust::transform(norm_begin, norm_end, norm_begin, normalize_vec);
-    cusp::krylov::cg(d_A, d_x, d_b, monitor, M);
-
-    thrust::transform(norm_begin, norm_end, norm_begin, normalize_vec);
-  }
-#else
-  {
-    cusp::relaxation::sor<real, cusp::device_memory> M(d_A, 1.0f);
-    // cusp::relaxation::jacobi<float, cusp::device_memory> M(d_A);
-    cusp::array1d<real, cusp::device_memory> d_r(nnormals * 3);
-
-    auto norm_begin = detail::zip_it(
-      d_x.begin(), d_x.begin() + nnormals, d_x.begin() + nnormals * 2);
-    auto norm_end = norm_begin + nnormals;
-
-    using vec3 = thrust::tuple<real, real, real>;
-    const auto normalize_vec = [] __host__ __device__(vec3 normal) {
-      const real rlen =
-        1.f / std::sqrt(sqr(normal.get<0>()) + sqr(normal.get<1>()) +
-                        sqr(normal.get<2>()));
-      normal.get<0>() *= rlen;
-      normal.get<1>() *= rlen;
-      normal.get<2>() = std::abs(normal.get<2>() * rlen);
-      return normal;
-    };
-    const auto normalize_all = [=] __host__ __device__ {
-      thrust::transform(norm_begin, norm_end, norm_begin, normalize_vec);
-    };
-    // Compute the initial residual
-    normalize_all();
-    cusp::multiply(d_A, d_x, d_r);
-    cusp::blas::axpy(d_b, d_r, -1.f);
-
-    // Monitor the convergence
-    cusp::monitor<real> monitor(d_b, 25, 1e-7, 0, true);
-
-    for (; !monitor.finished(d_r); ++monitor)
-    {
-      M(d_A, d_b, d_x);
-      // Compute the residual
-      cusp::multiply(d_A, d_x, d_r);
-      cusp::blas::axpy(d_b, d_r, -1.f);
-    }
+    apply_sor(d_A, d_b, d_x, 1.f, 1e-5f, 1500, true);
     // Normalize
-    normalize_all();
+    using vec3 = thrust::tuple<real, real, real>;
+    const auto normalize_vec = [] __host__ __device__(vec3 normal) {
+      const real rmag =
+        1.f / std::sqrt(sqr(normal.get<0>()) + sqr(normal.get<1>()) +
+                        sqr(normal.get<2>()));
+      normal.get<0>() *= rmag;
+      normal.get<1>() *= rmag;
+      normal.get<2>() = std::abs(normal.get<2>()) * rmag;
+      return normal;
+    };
+    // Normalize our resulting normals
+    auto norm_begin = detail::zip_it(
+      d_x.begin(), d_x.begin() + nnormals, d_x.begin() + nnormals * 2);
+    auto norm_end = norm_begin + nnormals;
+    thrust::transform(norm_begin, norm_end, norm_begin, normalize_vec);
   }
-#endif
   printf("Done\n");
-  auto d_relative_normals = cusp::make_array2d_view(
+  auto d_initial_normals = cusp::make_array2d_view(
     3, nnormals, nnormals, cusp::make_array1d_view(d_x), cusp::row_major{});
-  make_host_image(d_relative_normals, h_image.get());
-  stbi::writef("relative_normals.png", h_image);
-  //cusp::print(d_x.subarray(0, 10));
-  //cusp::print(d_x.subarray(nnormals, 10));
-  //cusp::print(d_x.subarray(nnormals * 2, 10));
+  cusp::array2d<real, cusp::device_memory> normal_copy = d_initial_normals;
+  thrust::transform(normal_copy.values.begin(),
+                    normal_copy.values.end(),
+                    normal_copy.values.begin(),
+                    detail::unary_plus<real>(1.f));
+  thrust::transform(normal_copy.values.begin(),
+                    normal_copy.values.end(),
+                    normal_copy.values.begin(),
+                    detail::unary_multiplies<real>(0.5f));
+  make_host_image(normal_copy, h_image.get());
+  stbi::writef("initial_normals.png", h_image);
 
-#if 1
   // Now that we have relative normals, we calculate the relative heights
   cusp::coo_matrix<int, real, cusp::device_memory> d_Q(
     nnormals, nnormals, height * (4 * width - 2) - 2 * width);
   // Initialize a grid matrix using CUSP
   cusp::gallery::grid2d(d_Q, width, height);
-  build_Q_values(d_relative_normals, d_Q);
-  //cusp::print(d_Q.values.subarray(0, 20));
-  //cusp::print(d_Q.row_indices.subarray(0, 20));
-  //cusp::print(d_Q.column_indices.subarray(0, 20));
+  build_Q_values(d_initial_normals, d_Q);
 
   // Now we can assemble a poisson problem to solve the absolute heights
   cusp::array1d<real, cusp::device_memory> d_pb(nnormals);
@@ -758,8 +671,6 @@ int main(int argc, char* argv[])
                         d_Q.values.begin(),
                         thrust::make_discard_iterator(),
                         d_pb.begin());
-  printf("pb: \n");
-  //cusp::print(d_pb.subarray(0, 20));
 
   // The A matrix
   cusp::coo_matrix<int, real, cusp::device_memory> d_pA(
@@ -783,73 +694,47 @@ int main(int argc, char* argv[])
   // Fix the boundary cell diagonals
   thrust::transform(pA_begin, pA_begin + d_pA.num_entries, pA_begin, fix_bnds);
   // To get a result we need to "pin" the solution by setting an arbitrary
-  // value to some constant. I use the final height.
-  // Make the last equation a trivial solution
+  // value to some constant. I use the first height.
+  // Make the first equation a trivial solution 1*h0 = x
   d_pA.values.begin()[0] = 1.f;
   d_pA.values.begin()[1] = 0.f;
   d_pA.values.begin()[2] = 0.f;
   // Need to replace any references to the final solution with constants in b
   d_pA.values.begin()[3] = 0.f;
   d_pA.values.begin()[4 * width - 2] = 0.f;
-  d_pb[0] = 1.f;
+  d_pb[0] = 0.5f;
   d_pb.begin()[1] += d_pb[0];
   d_pb.begin()[width] += d_pb[0];
-  std::cout<<"q10: "<<d_Q.values[2]<<'\n';
 
-  cusp::array1d<real, cusp::device_memory> d_h(nnormals, 1.f);
+  cusp::array1d<real, cusp::device_memory> d_h(nnormals, 0.5f);
   d_h[0] = d_pb[0];
-#if 0
-  {
-    cusp::precond::diagonal<real, cusp::device_memory> M(d_pA);
-    cusp::monitor<real> monitor(d_pb, std::stoi(argv[5]), 1e-4, 0, true);
-    cusp::krylov::cg(d_pA, d_h, d_pb, monitor, M);
-  }
-#else
   {
     cusp::csr_matrix<int, real, cusp::device_memory> pA(
       d_pA.num_rows, d_pA.num_cols, d_pA.num_entries);
     cusp::indices_to_offsets(d_pA.row_indices, pA.row_offsets);
     pA.column_indices = d_pA.column_indices;
     pA.values = d_pA.values;
-    // cusp::relaxation::sor<real, cusp::device_memory> M(pA, 1.0);
-    cusp::relaxation::jacobi<real, cusp::device_memory> M(pA);
-    cusp::array1d<real, cusp::device_memory> d_r(nnormals, 1.f);
-    // Monitor the convergence
-    cusp::monitor<real> monitor(d_pb, std::stoi(argv[5]), 1e-4, 0, true);
-    cusp::multiply(pA, d_h, d_r);
-    cusp::blas::axpy(d_pb, d_r, -1.f);
-
-    for (; !monitor.finished(d_r); ++monitor)
-    {
-      M(pA, d_pb, d_h);
-      // Compute the residual
-      cusp::multiply(pA, d_h, d_r);
-      cusp::blas::axpy(d_pb, d_r, -1.f);
-    }
+    apply_sor(pA, d_pb, d_h, 0.9f, 1e-4f, std::stoi(argv[5]), true);
   }
-#endif
-  printf("H0: %f, H1: %f, H2:%f, H4:%f, Q10: %f, Q12: %f, Q14: %f\n",
+  printf("H0: %f, H1: %f, H2:%f, H4:%f, Q01: %f, Q10: %f, Q12: %f, Q14: %f\n",
          (real)d_h[0],
          (real)d_h[1],
          (real)d_h[2],
          (real)d_h[4],
+         (real)d_Q.values[0],
          (real)d_Q.values[2],
          (real)d_Q.values[3],
          (real)d_Q.values[4]);
-  //cusp::print(d_Q);
-  //cusp::print(d_relative_normals);
-
   print_range_avg(d_h);
   normalize(d_h);
 
   const auto h_out = detail::zip_it(d_h.begin(), d_h.begin(), d_h.begin());
-  const auto rn_begin = detail::zip_it(d_relative_normals.row(0).begin(),
-                                       d_relative_normals.row(1).begin(),
-                                       d_relative_normals.row(2).begin());
+  const auto rn_begin = detail::zip_it(d_initial_normals.row(0).begin(),
+                                       d_initial_normals.row(1).begin(),
+                                       d_initial_normals.row(2).begin());
   thrust::copy_n(h_out, nnormals, rn_begin);
 
-  make_host_image(d_relative_normals, h_image.get());
+  make_host_image(d_initial_normals, h_image.get());
   stbi::writef("height.png", h_image);
-#endif
 }
 
