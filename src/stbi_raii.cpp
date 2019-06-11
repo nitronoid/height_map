@@ -108,17 +108,27 @@ ScopedImage loadf(gsl::czstring i_path, int i_desired_channels)
                      i_desired_channels ? i_desired_channels : nchannels);
 }
 
-void writef(gsl::czstring i_path, const ScopedImage& i_image)
+std::vector<uint8_t> quantize(const ScopedImage& i_image)
 {
   std::vector<uint8_t> quantized(i_image.n_pixel_data());
   std::transform(i_image.get(),
                  i_image.get() + i_image.n_pixel_data(),
                  quantized.begin(),
-                 [](real v) {
-                   const float gamma = 1.0f / 2.2f;
-                   return pow(clamp(v, 0.f, 1.f), gamma) * 255.0f + 0.5f;
-                 });
+                 [=](real v) { return clamp(v, 0.f, 1.f) * 255.0f + 0.5f; });
+  return quantized;
+}
 
+void gamma_correct(const ScopedImage& i_image, real* o_image, const real gamma)
+{
+  std::transform(i_image.get(),
+                 i_image.get() + i_image.n_pixel_data(),
+                 o_image,
+                 [=](real v) { return pow(v, gamma); });
+}
+
+void writef(gsl::czstring i_path, const ScopedImage& i_image)
+{
+  auto quantized = quantize(i_image);
   stbi_write_png(i_path,
                  i_image.width(),
                  i_image.height(),
@@ -126,5 +136,6 @@ void writef(gsl::czstring i_path, const ScopedImage& i_image)
                  quantized.data(),
                  i_image.n_channels() * i_image.width());
 }
+
 }  // namespace stbi
 

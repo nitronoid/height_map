@@ -427,7 +427,7 @@ struct relative_height_from_normals
     const real y = n1.get<1>() - n2.get<1>();
 
     real q;
-    constexpr float epsilon = 0.000001f;
+    constexpr float epsilon = 0.0000001f;
     if (std::abs(x) > epsilon)
     {
       q = y / x;
@@ -436,11 +436,11 @@ struct relative_height_from_normals
     {
       const auto inf = std::numeric_limits<real>::infinity();
       const real g1 =
-        n1.get<0>() == 0.f ? inf : std::abs(n1.get<1>() / n1.get<0>());
+        n1.get<0>() == 0.f ? inf : n1.get<1>() / n1.get<0>();
       if (g1 == inf)
         q = 0.f;
       else if (g1 == 0.f)
-        q = 0.f;  // inf
+        q = 1.f / epsilon;
       else
         q = 1.f / g1;
     }
